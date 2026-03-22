@@ -1,0 +1,34 @@
+{
+  "name": "pagenexus-desktop-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mariozechner/mini-lit": "^0.2.1",
+    "@mariozechner/pi-agent-core": "^0.61.1",
+    "@mariozechner/pi-ai": "^0.61.1",
+    "@mariozechner/pi-web-ui": "^0.61.1",
+    "@sinclair/typebox": "^0.34.41",
+    "@tauri-apps/api": "^2.3.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "lit": "^3.3.2",
+    "lucide-react": "^0.511.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.17",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0",
+    "vitest": "^3.1.4"
+  }
+}
