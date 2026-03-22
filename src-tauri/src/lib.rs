@@ -1474,7 +1474,25 @@ async fn upload_pdf(
         fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
 
         let chunks = if extension == ".pdf" {
-            create_mineru_chunks(&stored_source, &chunks_dir, &initial.file_name, &doc_id)?
+            let file_size = fs::metadata(&stored_source)
+                .map_err(|error| error.to_string())?
+                .len();
+            let page_count = count_pdf_pages(&stored_source)?;
+
+            if file_size <= MINERU_MAX_FILE_BYTES && page_count <= MINERU_MAX_PAGES_PER_FILE {
+                emit_parser_log(
+                    &app,
+                    &kb_id,
+                    &doc_id,
+                    format!(
+                        "PDF size/page count is within threshold ({} bytes, {} pages), using single-file upload without chunking.",
+                        file_size, page_count
+                    ),
+                );
+                create_single_file_manifest(&stored_source, &initial.file_name, &doc_id)?
+            } else {
+                create_mineru_chunks(&stored_source, &chunks_dir, &initial.file_name, &doc_id)?
+            }
         } else {
             create_single_file_manifest(&stored_source, &initial.file_name, &doc_id)?
         };
