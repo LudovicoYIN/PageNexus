@@ -32,11 +32,6 @@ jobs:
             package-lock.json
             frontend/package-lock.json
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -47,10 +42,6 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-
-      - name: Bootstrap embedded Python runtime
-        working-directory: .
-        run: python python/bootstrap_runtime.py
 
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v1
