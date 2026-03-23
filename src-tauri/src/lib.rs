@@ -27,9 +27,11 @@ const MINERU_MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
 const MINERU_TARGET_FILE_BYTES: u64 = 170 * 1024 * 1024;
 const MINERU_MAX_PAGES_PER_FILE: usize = 600;
 const MINERU_TARGET_PAGES_PER_FILE: usize = 240;
+const MINERU_UPLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
+    settings_dir: PathBuf,
     data_dir: PathBuf,
     db_path: PathBuf,
     agents: Arc<Mutex<HashMap<String, AgentProcess>>>,
@@ -42,6 +44,7 @@ struct AppSettings {
     packy_api_base_url: String,
     packy_model_id: String,
     mineru_api_token: String,
+    storage_dir: String,
 }
 
 impl Default for AppSettings {
@@ -51,6 +54,7 @@ impl Default for AppSettings {
             packy_api_base_url: PACKY_API_BASE_URL.to_string(),
             packy_model_id: PACKY_MODEL_ID.to_string(),
             mineru_api_token: String::new(),
+            storage_dir: String::new(),
         }
     }
 }
@@ -349,11 +353,15 @@ fn session_file_path(state: &AppState, kb_id: &str) -> PathBuf {
 }
 
 fn settings_file_path(state: &AppState) -> PathBuf {
-    state.data_dir.join("settings.json")
+    state.settings_dir.join("settings.json")
 }
 
 fn load_app_settings(state: &AppState) -> Result<AppSettings, String> {
     let path = settings_file_path(state);
+    load_app_settings_from_path(&path)
+}
+
+fn load_app_settings_from_path(path: &Path) -> Result<AppSettings, String> {
     if !path.exists() {
         return Ok(AppSettings::default());
     }
@@ -366,6 +374,29 @@ fn save_app_settings_file(state: &AppState, settings: &AppSettings) -> Result<()
     let path = settings_file_path(state);
     let contents = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
     fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn resolve_storage_dir(default_dir: &Path, settings: &AppSettings) -> PathBuf {
+    let trimmed = settings.storage_dir.trim();
+    if trimmed.is_empty() {
+        return default_dir.to_path_buf();
+    }
+    PathBuf::from(trimmed)
+}
+
+fn validate_storage_dir(storage_dir: &str) -> Result<(), String> {
+    let trimmed = storage_dir.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("存储目录不存在: {}", trimmed));
+    }
+    if !path.is_dir() {
+        return Err(format!("存储路径不是文件夹: {}", trimmed));
+    }
+    Ok(())
 }
 
 fn node_binary_path() -> PathBuf {
@@ -749,16 +780,18 @@ fn count_pdf_pages(source: &Path) -> Result<usize, String> {
     Ok(document.get_pages().len())
 }
 
-fn save_pdf_page_range(source: &Path, start_page: usize, end_page: usize, target: &Path) -> Result<u64, String> {
-    let document = LoPdfDocument::load(source).map_err(|error| error.to_string())?;
-    let all_pages = document
-        .get_pages()
-        .into_keys()
-        .collect::<Vec<_>>();
+fn save_pdf_page_range(
+    document: &LoPdfDocument,
+    all_pages: &[u32],
+    start_page: usize,
+    end_page: usize,
+    target: &Path,
+) -> Result<u64, String> {
     let keep = (start_page as u32..=end_page as u32).collect::<HashSet<_>>();
     let mut chunk = document.clone();
     let delete_pages = all_pages
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|page_number| !keep.contains(page_number))
         .collect::<Vec<_>>();
 
@@ -784,7 +817,8 @@ fn file_stem_for_chunks(file_name: &str) -> String {
 }
 
 fn push_pdf_chunk(
-    source: &Path,
+    document: &LoPdfDocument,
+    all_pages: &[u32],
     output_dir: &Path,
     file_stem: &str,
     doc_id: &str,
@@ -797,13 +831,33 @@ fn push_pdf_chunk(
     let chunk_id = format!("part-{:03}-p{}-{}", *index, start_page, end_page);
     let file_name = format!("{file_stem}-{chunk_id}.pdf");
     let path = output_dir.join(&file_name);
-    let size = save_pdf_page_range(source, start_page, end_page, &path)?;
+    let size = save_pdf_page_range(document, all_pages, start_page, end_page, &path)?;
 
     if size > MINERU_MAX_FILE_BYTES && page_count > 1 {
         let _ = fs::remove_file(&path);
         let midpoint = start_page + (page_count / 2) - 1;
-        push_pdf_chunk(source, output_dir, file_stem, doc_id, start_page, midpoint, index, chunks)?;
-        push_pdf_chunk(source, output_dir, file_stem, doc_id, midpoint + 1, end_page, index, chunks)?;
+        push_pdf_chunk(
+            document,
+            all_pages,
+            output_dir,
+            file_stem,
+            doc_id,
+            start_page,
+            midpoint,
+            index,
+            chunks,
+        )?;
+        push_pdf_chunk(
+            document,
+            all_pages,
+            output_dir,
+            file_stem,
+            doc_id,
+            midpoint + 1,
+            end_page,
+            index,
+            chunks,
+        )?;
         return Ok(());
     }
 
@@ -821,30 +875,116 @@ fn push_pdf_chunk(
     Ok(())
 }
 
+fn optimize_single_page_chunk(path: &Path) -> Result<u64, String> {
+    let mut document = LoPdfDocument::load(path).map_err(|error| error.to_string())?;
+    document.prune_objects();
+    document.renumber_objects();
+    document.compress();
+    document.save(path).map_err(|error| error.to_string())?;
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| error.to_string())
+}
+
 fn create_mineru_chunks(
     source: &Path,
     output_dir: &Path,
     original_file_name: &str,
     doc_id: &str,
 ) -> Result<Vec<MineruChunkManifest>, String> {
-    let page_count = count_pdf_pages(source)?;
+    let document = LoPdfDocument::load(source).map_err(|error| error.to_string())?;
+    let all_pages = document.get_pages().into_keys().collect::<Vec<_>>();
+    let page_count = all_pages.len();
     if page_count == 0 {
         return Err("PDF 没有可解析页。".to_string());
     }
 
     let file_size = fs::metadata(source).map_err(|error| error.to_string())?.len();
     let initial_chunk_pages = compute_initial_pdf_chunk_pages(page_count, file_size);
-    let mut chunks = Vec::new();
-    let mut index = 1usize;
+    let mut chunks = Vec::<MineruChunkManifest>::new();
+    let mut oversized = Vec::<MineruChunkManifest>::new();
+    let mut index = 1_usize;
     let file_stem = file_stem_for_chunks(original_file_name);
     let mut start = 1usize;
 
+    // Stage 1: fast coarse split by page window.
     while start <= page_count {
         let end = (start + initial_chunk_pages - 1).min(page_count).min(start + MINERU_MAX_PAGES_PER_FILE - 1);
-        push_pdf_chunk(source, output_dir, &file_stem, doc_id, start, end, &mut index, &mut chunks)?;
+        let page_count = end.saturating_sub(start) + 1;
+        let chunk_id = format!("part-{:03}-p{}-{}", index, start, end);
+        let file_name = format!("{file_stem}-{chunk_id}.pdf");
+        let path = output_dir.join(&file_name);
+        let size = save_pdf_page_range(&document, &all_pages, start, end, &path)?;
+        let manifest = MineruChunkManifest {
+            chunk_id: chunk_id.clone(),
+            file_name,
+            page_start: start,
+            page_end: end,
+            page_count,
+            data_id: format!("{doc_id}-{chunk_id}"),
+            local_pdf_path: path.to_string_lossy().to_string(),
+        };
+        if size > MINERU_MAX_FILE_BYTES {
+            oversized.push(manifest);
+        } else {
+            chunks.push(manifest);
+        }
+        index += 1;
         start = end + 1;
     }
 
+    // Stage 2: only refine oversized chunks (binary split).
+    while let Some(parent) = oversized.pop() {
+        let parent_path = PathBuf::from(&parent.local_pdf_path);
+        let parent_size = fs::metadata(&parent_path)
+            .map(|metadata| metadata.len())
+            .map_err(|error| error.to_string())?;
+        if parent_size <= MINERU_MAX_FILE_BYTES {
+            chunks.push(parent);
+            continue;
+        }
+
+        if parent.page_count <= 1 {
+            let optimized_size = optimize_single_page_chunk(&parent_path)?;
+            if optimized_size <= MINERU_MAX_FILE_BYTES {
+                chunks.push(parent);
+                continue;
+            }
+            return Err(format!(
+                "Single-page chunk still exceeds 200MB after fallback optimization: {} ({} bytes)",
+                parent.file_name, optimized_size
+            ));
+        }
+
+        let _ = fs::remove_file(&parent_path);
+        let midpoint = parent.page_start + (parent.page_count / 2) - 1;
+        let sub_ranges = [(parent.page_start, midpoint), (midpoint + 1, parent.page_end)];
+
+        for (sub_start, sub_end) in sub_ranges {
+            let sub_page_count = sub_end.saturating_sub(sub_start) + 1;
+            let sub_chunk_id = format!("part-{:03}-p{}-{}", index, sub_start, sub_end);
+            let sub_file_name = format!("{file_stem}-{sub_chunk_id}.pdf");
+            let sub_path = output_dir.join(&sub_file_name);
+            let sub_size = save_pdf_page_range(&document, &all_pages, sub_start, sub_end, &sub_path)?;
+            let sub_manifest = MineruChunkManifest {
+                chunk_id: sub_chunk_id.clone(),
+                file_name: sub_file_name,
+                page_start: sub_start,
+                page_end: sub_end,
+                page_count: sub_page_count,
+                data_id: format!("{doc_id}-{sub_chunk_id}"),
+                local_pdf_path: sub_path.to_string_lossy().to_string(),
+            };
+            if sub_size > MINERU_MAX_FILE_BYTES {
+                oversized.push(sub_manifest);
+            } else {
+                chunks.push(sub_manifest);
+            }
+            index += 1;
+        }
+    }
+
+    chunks.sort_by_key(|item| item.page_start);
     Ok(chunks)
 }
 
@@ -865,6 +1005,7 @@ fn create_single_file_manifest(source: &Path, original_file_name: &str, doc_id: 
     }])
 }
 
+#[allow(unreachable_code)]
 async fn submit_mineru_batch(
     app: &AppHandle,
     kb_id: &str,
@@ -917,6 +1058,15 @@ async fn submit_mineru_batch(
         return Err("MinerU 返回的上传链接数量与切块数量不一致。".to_string());
     }
 
+    #[derive(Clone)]
+    struct UploadJob {
+        file_name: String,
+        local_pdf_path: String,
+        upload_url: String,
+    }
+
+    let mut upload_jobs = Vec::<UploadJob>::new();
+
     for (chunk, upload_url) in chunks.iter().zip(envelope.data.file_urls.iter()) {
         emit_parser_log(
             app,
@@ -927,6 +1077,12 @@ async fn submit_mineru_batch(
                 chunk.file_name, chunk.page_start, chunk.page_end
             ),
         );
+        upload_jobs.push(UploadJob {
+            file_name: chunk.file_name.clone(),
+            local_pdf_path: chunk.local_pdf_path.clone(),
+            upload_url: upload_url.clone(),
+        });
+        continue;
         let bytes = fs::read(&chunk.local_pdf_path).map_err(|error| error.to_string())?;
         let response = client
             .put(upload_url)
@@ -936,6 +1092,36 @@ async fn submit_mineru_batch(
             .map_err(|error| error.to_string())?;
         if !response.status().is_success() {
             return Err(format!("MinerU 文件上传失败：{} -> {}", chunk.file_name, response.status()));
+        }
+    }
+
+    for job_group in upload_jobs.chunks(MINERU_UPLOAD_CONCURRENCY) {
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for job in job_group {
+            let client = client.clone();
+            let job = job.clone();
+
+            join_set.spawn(async move {
+                let bytes = fs::read(&job.local_pdf_path).map_err(|error| error.to_string())?;
+                let response = client
+                    .put(&job.upload_url)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("MinerU file upload failed: {} -> {}", job.file_name, response.status()));
+                }
+                Ok::<(), String>(())
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(inner) => inner?,
+                Err(error) => return Err(format!("MinerU upload task join error: {error}")),
+            }
         }
     }
 
@@ -1316,6 +1502,162 @@ async fn merge_mineru_results(
     Ok(parsed)
 }
 
+fn mineru_root_dir(doc_dir: &Path) -> PathBuf {
+    doc_dir.join("mineru")
+}
+
+fn chunk_input_dir(doc_dir: &Path) -> PathBuf {
+    mineru_root_dir(doc_dir).join("input")
+}
+
+fn chunk_cache_manifest_path(doc_dir: &Path) -> PathBuf {
+    mineru_root_dir(doc_dir).join("chunk_manifest.json")
+}
+
+fn save_chunk_cache_manifest(doc_dir: &Path, chunks: &[MineruChunkManifest]) -> Result<(), String> {
+    let manifest_path = chunk_cache_manifest_path(doc_dir);
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(chunks).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn load_chunk_cache_manifest(doc_dir: &Path) -> Result<Option<Vec<MineruChunkManifest>>, String> {
+    let manifest_path = chunk_cache_manifest_path(doc_dir);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let chunks = serde_json::from_str::<Vec<MineruChunkManifest>>(
+        &fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+    if chunks
+        .iter()
+        .all(|chunk| Path::new(&chunk.local_pdf_path).exists())
+    {
+        return Ok(Some(chunks));
+    }
+    Ok(None)
+}
+
+fn clear_chunk_cache(doc_dir: &Path) -> Result<(), String> {
+    let input_dir = chunk_input_dir(doc_dir);
+    if input_dir.exists() {
+        fs::remove_dir_all(input_dir).map_err(|error| error.to_string())?;
+    }
+    let manifest_path = chunk_cache_manifest_path(doc_dir);
+    if manifest_path.exists() {
+        fs::remove_file(manifest_path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn build_or_reuse_mineru_chunks(
+    app: &AppHandle,
+    kb_id: &str,
+    doc_id: &str,
+    source: &Path,
+    original_file_name: &str,
+    extension: &str,
+    doc_dir: &Path,
+) -> Result<Vec<MineruChunkManifest>, String> {
+    if let Some(cached) = load_chunk_cache_manifest(doc_dir)? {
+        emit_parser_log(
+            app,
+            kb_id,
+            doc_id,
+            format!("检测到切块缓存，直接复用 {} 个输入文件。", cached.len()),
+        );
+        return Ok(cached);
+    }
+
+    let input_dir = chunk_input_dir(doc_dir);
+    fs::create_dir_all(&input_dir).map_err(|error| error.to_string())?;
+
+    let chunks = if extension == ".pdf" {
+        let file_size = fs::metadata(source).map_err(|error| error.to_string())?.len();
+        let page_count = count_pdf_pages(source)?;
+        if file_size <= MINERU_MAX_FILE_BYTES && page_count <= MINERU_MAX_PAGES_PER_FILE {
+            emit_parser_log(
+                app,
+                kb_id,
+                doc_id,
+                format!(
+                    "PDF size/page count is within threshold ({} bytes, {} pages), using single-file upload without chunking.",
+                    file_size, page_count
+                ),
+            );
+            create_single_file_manifest(source, original_file_name, doc_id)?
+        } else {
+            create_mineru_chunks(source, &input_dir, original_file_name, doc_id)?
+        }
+    } else {
+        create_single_file_manifest(source, original_file_name, doc_id)?
+    };
+
+    emit_parser_log(
+        app,
+        kb_id,
+        doc_id,
+        format!("切块完成，共 {} 个输入文件。", chunks.len()),
+    );
+    save_chunk_cache_manifest(doc_dir, &chunks)?;
+    Ok(chunks)
+}
+
+async fn parse_document_with_mineru(
+    app: &AppHandle,
+    kb_id: &str,
+    doc_id: &str,
+    original_file_name: &str,
+    source: &Path,
+    extension: &str,
+    mineru_token: &str,
+    doc_dir: &Path,
+) -> Result<ParsedDocumentFile, String> {
+    let chunks = build_or_reuse_mineru_chunks(app, kb_id, doc_id, source, original_file_name, extension, doc_dir)?;
+
+    let batch_status = submit_mineru_batch(app, kb_id, doc_id, mineru_token, &chunks).await?;
+    let batch_manifest = MineruBatchManifest {
+        batch_id: batch_status.batch_id.clone(),
+        chunks: chunks.clone(),
+    };
+    fs::write(
+        mineru_root_dir(doc_dir).join("batch_manifest.json"),
+        serde_json::to_string_pretty(&batch_manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let parsed = merge_mineru_results(
+        app,
+        kb_id,
+        doc_dir,
+        original_file_name,
+        doc_id,
+        &chunks,
+        &batch_status.extract_result,
+    )
+    .await?;
+
+    if let Err(error) = clear_chunk_cache(doc_dir) {
+        emit_parser_log(
+            app,
+            kb_id,
+            doc_id,
+            format!("解析成功，但清理切块缓存失败：{}", error),
+        );
+    }
+
+    Ok(parsed)
+}
+
 fn write_kb_catalog(state: &AppState, kb_id: &str) -> Result<(), String> {
     let connection = db_connection(&state.db_path)?;
     let mut statement = connection
@@ -1397,6 +1739,51 @@ fn list_knowledge_bases(state: State<'_, AppState>) -> Result<Vec<KnowledgeBase>
 }
 
 #[tauri::command]
+fn delete_knowledge_base(kb_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = db_connection(&state.db_path)?;
+    let exists: Option<String> = connection
+        .query_row(
+            "SELECT id FROM knowledge_bases WHERE id = ?1",
+            [kb_id.clone()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if exists.is_none() {
+        return Err("知识库不存在。".to_string());
+    }
+
+    connection
+        .execute(
+            "DELETE FROM pages WHERE doc_id IN (SELECT id FROM documents WHERE kb_id = ?1)",
+            [kb_id.clone()],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM documents WHERE kb_id = ?1", [kb_id.clone()])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM chat_sessions WHERE kb_id = ?1", [kb_id.clone()])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM knowledge_bases WHERE id = ?1", [kb_id.clone()])
+        .map_err(|error| error.to_string())?;
+
+    let kb_dir = knowledge_base_dir(&state, &kb_id);
+    if kb_dir.exists() {
+        fs::remove_dir_all(kb_dir).map_err(|error| error.to_string())?;
+    }
+
+    if let Ok(mut agents) = state.agents.lock() {
+        if let Some(process) = agents.remove(&kb_id) {
+            let _ = stop_agent_process(process);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn upload_pdf(
     kb_id: String,
     file_path: String,
@@ -1470,14 +1857,15 @@ async fn upload_pdf(
     }
 
     let parse_result: Result<ParsedDocumentFile, String> = async {
-        let chunks_dir = doc_dir.join("mineru").join("input");
-        fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
-
-        let chunks = if extension == ".pdf" {
-            create_mineru_chunks(&stored_source, &chunks_dir, &initial.file_name, &doc_id)?
-        } else {
-            create_single_file_manifest(&stored_source, &initial.file_name, &doc_id)?
-        };
+        let chunks = build_or_reuse_mineru_chunks(
+            &app,
+            &kb_id,
+            &doc_id,
+            &stored_source,
+            &initial.file_name,
+            extension,
+            &doc_dir,
+        )?;
         emit_parser_log(
             &app,
             &kb_id,
@@ -1528,6 +1916,14 @@ async fn upload_pdf(
     }
 
     let parsed = parse_result?;
+    if let Err(error) = clear_chunk_cache(&doc_dir) {
+        emit_parser_log(
+            &app,
+            &kb_id,
+            &doc_id,
+            format!("解析成功，但清理切块缓存失败：{}", error),
+        );
+    }
 
     let connection = db_connection(&state.db_path)?;
     connection
@@ -1543,6 +1939,105 @@ async fn upload_pdf(
         )
         .map_err(|error| error.to_string())?;
     write_kb_catalog(&state, &kb_id)?;
+
+    connection
+        .query_row(
+            "SELECT id, kb_id, file_name, source_path, page_count, status, error_message, created_at, updated_at FROM documents WHERE id = ?1",
+            [doc_id],
+            row_to_document,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn retry_document_parse(doc_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<DocumentRecord, String> {
+    let connection = db_connection(&state.db_path)?;
+    let document = connection
+        .query_row(
+            "SELECT id, kb_id, file_name, source_path, page_count, status, error_message, created_at, updated_at FROM documents WHERE id = ?1",
+            [doc_id.clone()],
+            row_to_document,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "文档不存在。".to_string())?;
+
+    if document.status == "parsing" {
+        return Err("文档正在解析中，请稍后重试。".to_string());
+    }
+
+    let extension = ensure_supported_document(&document.source_path)?;
+    let source = PathBuf::from(&document.source_path);
+    if !source.exists() {
+        return Err("文档源文件不存在，无法重试。".to_string());
+    }
+
+    let settings = load_app_settings(&state)?;
+    let mineru_token = settings.mineru_api_token.trim().to_string();
+    if mineru_token.is_empty() {
+        return Err("未配置 MinerU Token，请先到设置页保存。".to_string());
+    }
+
+    connection
+        .execute(
+            "UPDATE documents SET status = 'parsing', error_message = NULL, updated_at = ?2 WHERE id = ?1",
+            params![document.id, now()],
+        )
+        .map_err(|error| error.to_string())?;
+    emit_parser_log(
+        &app,
+        &document.kb_id,
+        &document.id,
+        format!("开始重试解析文档：{}", document.file_name),
+    );
+
+    let doc_dir = document_dir(&state, &document.kb_id, &document.id);
+    fs::create_dir_all(&doc_dir).map_err(|error| error.to_string())?;
+    let parse_result = parse_document_with_mineru(
+        &app,
+        &document.kb_id,
+        &document.id,
+        &document.file_name,
+        &source,
+        extension,
+        &mineru_token,
+        &doc_dir,
+    )
+    .await;
+
+    if let Err(message) = parse_result {
+        let connection = db_connection(&state.db_path)?;
+        connection
+            .execute(
+                "UPDATE documents SET status = 'failed', error_message = ?2, updated_at = ?3 WHERE id = ?1",
+                params![document.id, message, now()],
+            )
+            .map_err(|error| error.to_string())?;
+
+        return connection
+            .query_row(
+                "SELECT id, kb_id, file_name, source_path, page_count, status, error_message, created_at, updated_at FROM documents WHERE id = ?1",
+                [doc_id],
+                row_to_document,
+            )
+            .map_err(|error| error.to_string());
+    }
+
+    let parsed = parse_result?;
+    let connection = db_connection(&state.db_path)?;
+    connection
+        .execute(
+            "UPDATE documents SET status = 'parsed', page_count = ?2, error_message = NULL, updated_at = ?3 WHERE id = ?1",
+            params![document.id, parsed.page_count, now()],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE knowledge_bases SET updated_at = ?2 WHERE id = ?1",
+            params![document.kb_id, now()],
+        )
+        .map_err(|error| error.to_string())?;
+    write_kb_catalog(&state, &document.kb_id)?;
 
     connection
         .query_row(
@@ -1830,7 +2325,13 @@ fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 
 #[tauri::command]
 fn save_app_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
+    validate_storage_dir(&settings.storage_dir)?;
     save_app_settings_file(&state, &settings)
+}
+
+#[tauri::command]
+fn get_effective_storage_path(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.data_dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1926,12 +2427,17 @@ async fn check_model_health(state: State<'_, AppState>) -> Result<ModelHealth, S
 }
 
 fn prepare_state(app: &AppHandle) -> Result<AppState, String> {
-    let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let settings_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    fs::create_dir_all(&settings_dir).map_err(|error| error.to_string())?;
+    let settings_path = settings_dir.join("settings.json");
+    let settings = load_app_settings_from_path(&settings_path)?;
+    let data_dir = resolve_storage_dir(&settings_dir, &settings);
     fs::create_dir_all(data_dir.join("kbs")).map_err(|error| error.to_string())?;
     let db_path = data_dir.join("pagenexus.sqlite3");
     init_schema(&db_path)?;
 
     Ok(AppState {
+        settings_dir,
         data_dir,
         db_path,
         agents: Arc::new(Mutex::new(HashMap::new())),
@@ -1949,7 +2455,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_knowledge_base,
             list_knowledge_bases,
+            delete_knowledge_base,
             upload_pdf,
+            retry_document_parse,
             list_documents,
             search_text,
             read_pages,
@@ -1961,6 +2469,7 @@ pub fn run() {
             prompt_coding_agent,
             get_app_settings,
             save_app_settings,
+            get_effective_storage_path,
             abort_coding_agent,
             stop_coding_agent,
             check_model_health
