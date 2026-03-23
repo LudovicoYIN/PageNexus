@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -984,6 +984,34 @@ fn count_pdf_pages(source: &Path) -> Result<usize, String> {
     Ok(document.get_pages().len())
 }
 
+fn count_pdf_pages_with_python(app: &AppHandle, state: &AppState, source: &Path) -> Result<usize, String> {
+    let python_bin = resolve_python_binary_path(app, state)?;
+    let probe = r#"import fitz, sys; doc = fitz.open(sys.argv[1]); print(len(doc))"#;
+    let output = Command::new(&python_bin)
+        .arg("-c")
+        .arg(probe)
+        .arg(source)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to launch python for page counting ({}): {}",
+                python_bin.to_string_lossy(),
+                error
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("python page count failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    stdout
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("python page count parse failed: {}", error))
+}
+
 fn save_pdf_page_range(
     document: &LoPdfDocument,
     all_pages: &[u32],
@@ -1135,18 +1163,17 @@ fn create_mineru_chunks(
 
 fn create_mineru_chunks_with_python(
     app: &AppHandle,
+    kb_id: &str,
     state: &AppState,
     source: &Path,
     output_dir: &Path,
     original_file_name: &str,
     doc_id: &str,
 ) -> Result<Vec<MineruChunkManifest>, String> {
-    let file_size = fs::metadata(source).map_err(|error| error.to_string())?.len();
-    let page_count = count_pdf_pages(source)?;
-    let target_pages = compute_initial_pdf_chunk_pages(page_count, file_size);
     let file_stem = file_stem_for_chunks(original_file_name);
     let python_bin = resolve_python_binary_path(app, state)?;
     let splitter_script = python_splitter_script_path(app);
+    let split_started = Instant::now();
 
     if !splitter_script.exists() {
         return Err(format!(
@@ -1170,7 +1197,7 @@ fn create_mineru_chunks_with_python(
         .arg("--max-pages")
         .arg(MINERU_MAX_PAGES_PER_FILE.to_string())
         .arg("--target-pages")
-        .arg(target_pages.to_string())
+        .arg(MINERU_TARGET_PAGES_PER_FILE.to_string())
         .output()
         .map_err(|error| {
             format!(
@@ -1206,6 +1233,17 @@ fn create_mineru_chunks_with_python(
             local_pdf_path: chunk.local_pdf_path,
         })
         .collect::<Vec<_>>();
+
+    emit_parser_log(
+        app,
+        kb_id,
+        doc_id,
+        format!(
+            "Python splitter finished in {:.2}s, produced {} chunks.",
+            split_started.elapsed().as_secs_f64(),
+            chunks.len()
+        ),
+    );
 
     Ok(chunks)
 }
@@ -1806,7 +1844,18 @@ fn build_or_reuse_mineru_chunks(
 
     let chunks = if extension == ".pdf" {
         let file_size = fs::metadata(source).map_err(|error| error.to_string())?.len();
-        let page_count = count_pdf_pages(source)?;
+        let page_count = match count_pdf_pages_with_python(app, state, source) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_parser_log(
+                    app,
+                    kb_id,
+                    doc_id,
+                    format!("Python page count failed, fallback to Rust: {error}"),
+                );
+                count_pdf_pages(source)?
+            }
+        };
         if file_size <= MINERU_MAX_FILE_BYTES && page_count <= MINERU_MAX_PAGES_PER_FILE {
             emit_parser_log(
                 app,
@@ -1819,7 +1868,15 @@ fn build_or_reuse_mineru_chunks(
             );
             create_single_file_manifest(source, original_file_name, doc_id)?
         } else {
-            match create_mineru_chunks_with_python(app, state, source, &input_dir, original_file_name, doc_id) {
+            match create_mineru_chunks_with_python(
+                app,
+                kb_id,
+                state,
+                source,
+                &input_dir,
+                original_file_name,
+                doc_id,
+            ) {
                 Ok(chunks) => {
                     emit_parser_log(app, kb_id, doc_id, "已使用 Python splitter 完成 PDF 切块。");
                     chunks
