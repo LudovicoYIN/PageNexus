@@ -80,6 +80,14 @@ export async function stopCodingAgent(kbId: string): Promise<void> {
   return invoke("stop_coding_agent", { kbId });
 }
 
+export async function setCodingAgentSession(kbId: string, sessionId: string): Promise<void> {
+  return invoke("set_coding_agent_session", { kbId, sessionId });
+}
+
+export async function deleteCodingAgentSession(kbId: string, sessionId: string): Promise<void> {
+  return invoke("delete_coding_agent_session", { kbId, sessionId });
+}
+
 export async function checkModelHealth(): Promise<ModelHealth> {
   return invoke("check_model_health");
 }

@@ -32,7 +32,8 @@
     "targets": "all",
     "resources": [
       "../node/**/*",
-      "../python/**/*"
+      "../python/**/*",
+      "../node-runtime/**/*"
     ],
     "icon": [
       "icons/32x32.png",

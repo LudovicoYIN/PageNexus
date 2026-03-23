@@ -35,6 +35,7 @@ struct AppState {
     data_dir: PathBuf,
     db_path: PathBuf,
     agents: Arc<Mutex<HashMap<String, AgentProcess>>>,
+    agent_session_tags: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -433,18 +434,60 @@ fn validate_python_runtime_path(python_runtime_path: &str) -> Result<(), String>
     Ok(())
 }
 
-fn node_binary_path() -> PathBuf {
+fn bundled_node_bin_path(app: &AppHandle) -> Option<PathBuf> {
+    let candidates = if cfg!(target_os = "windows") {
+        vec![
+            "node-runtime/node.exe",
+            "node-runtime/bin/node.exe",
+            "_up_/node-runtime/node.exe",
+            "_up_/node-runtime/bin/node.exe",
+        ]
+    } else {
+        vec![
+            "node-runtime/bin/node",
+            "node-runtime/node",
+            "_up_/node-runtime/bin/node",
+            "_up_/node-runtime/node",
+        ]
+    };
+
+    for relative in candidates {
+        if let Some(path) = app.path().resolve(relative, BaseDirectory::Resource).ok() {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn node_binary_path(app: &AppHandle) -> PathBuf {
     if let Ok(explicit) = std::env::var("PAGENEXUS_NODE_BIN") {
         return PathBuf::from(explicit);
+    }
+    if let Some(path) = bundled_node_bin_path(app) {
+        return path;
     }
     PathBuf::from("node")
 }
 
 fn bundled_python_bin_path(app: &AppHandle) -> Option<PathBuf> {
     let candidates = if cfg!(target_os = "windows") {
-        vec!["python/python.exe", "python/venv/Scripts/python.exe"]
+        vec![
+            "python/python.exe",
+            "python/venv/Scripts/python.exe",
+            "_up_/python/python.exe",
+            "_up_/python/venv/Scripts/python.exe",
+        ]
     } else {
-        vec!["python/bin/python3", "python/venv/bin/python3", "python/bin/python"]
+        vec![
+            "python/bin/python3",
+            "python/venv/bin/python3",
+            "python/bin/python",
+            "_up_/python/bin/python3",
+            "_up_/python/venv/bin/python3",
+            "_up_/python/bin/python",
+        ]
     };
 
     for relative in candidates {
@@ -480,7 +523,32 @@ fn resolve_python_binary_path(app: &AppHandle, state: &AppState) -> Result<PathB
         return Ok(path);
     }
 
+    if let Some(path) = find_executable_in_path("python3") {
+        return Ok(path);
+    }
+    if let Some(path) = find_executable_in_path("python") {
+        return Ok(path);
+    }
+
     Ok(PathBuf::from("python3"))
+}
+
+fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.is_file() {
+            return fs::canonicalize(candidate).ok();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let candidate_exe = dir.join(format!("{binary}.exe"));
+            if candidate_exe.is_file() {
+                return fs::canonicalize(candidate_exe).ok();
+            }
+        }
+    }
+    None
 }
 
 fn python_splitter_script_path(app: &AppHandle) -> PathBuf {
@@ -489,11 +557,15 @@ fn python_splitter_script_path(app: &AppHandle) -> PathBuf {
         return local;
     }
 
-    app.path()
-        .resolve("python/pdf_splitter.py", BaseDirectory::Resource)
-        .ok()
-        .filter(|path| path.exists())
-        .unwrap_or(local)
+    for candidate in ["python/pdf_splitter.py", "_up_/python/pdf_splitter.py"] {
+        if let Some(path) = app.path().resolve(candidate, BaseDirectory::Resource).ok() {
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+
+    local
 }
 
 fn coding_agent_script_path(app: &AppHandle) -> PathBuf {
@@ -502,15 +574,54 @@ fn coding_agent_script_path(app: &AppHandle) -> PathBuf {
         return local;
     }
 
-    app.path()
-        .resolve("node/coding-agent-rpc.mjs", BaseDirectory::Resource)
-        .ok()
-        .filter(|path| path.exists())
-        .unwrap_or(local)
+    for candidate in ["node/coding-agent-rpc.mjs", "_up_/node/coding-agent-rpc.mjs"] {
+        if let Some(path) = app.path().resolve(candidate, BaseDirectory::Resource).ok() {
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+
+    local
 }
 
-fn coding_agent_home_dir(state: &AppState, kb_id: &str) -> PathBuf {
-    knowledge_base_dir(state, kb_id).join(".pagenexus-agent")
+fn sanitize_session_tag(session_id: &str) -> String {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return "default".to_string();
+    }
+
+    let mut normalized = String::new();
+    for char in trimmed.chars() {
+        if char.is_ascii_alphanumeric() || char == '-' || char == '_' {
+            normalized.push(char);
+        } else {
+            normalized.push('-');
+        }
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        "default".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn current_agent_session_tag(state: &AppState, kb_id: &str) -> String {
+    state
+        .agent_session_tags
+        .lock()
+        .ok()
+        .and_then(|tags| tags.get(kb_id).cloned())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn coding_agent_home_dir(state: &AppState, kb_id: &str, session_tag: &str) -> PathBuf {
+    knowledge_base_dir(state, kb_id)
+        .join(".pagenexus-agent")
+        .join("sessions")
+        .join(session_tag)
 }
 
 fn rpc_error_message(response: &serde_json::Value) -> String {
@@ -579,11 +690,12 @@ fn spawn_coding_agent(app: &AppHandle, state: &AppState, kb_id: &str) -> Result<
     let kb_dir = knowledge_base_dir(state, kb_id);
     fs::create_dir_all(&kb_dir).map_err(|error| error.to_string())?;
 
-    let agent_home = coding_agent_home_dir(state, kb_id);
+    let session_tag = current_agent_session_tag(state, kb_id);
+    let agent_home = coding_agent_home_dir(state, kb_id, &session_tag);
     fs::create_dir_all(&agent_home).map_err(|error| error.to_string())?;
 
     let script = coding_agent_script_path(app);
-    let node = node_binary_path();
+    let node = node_binary_path(app);
     let settings = load_app_settings(state)?;
     let python_bin = resolve_python_binary_path(app, state)?;
     let api_key = settings.packy_api_key.trim();
@@ -2499,6 +2611,58 @@ fn stop_coding_agent(kb_id: String, state: State<'_, AppState>) -> Result<(), St
 }
 
 #[tauri::command]
+fn set_coding_agent_session(kb_id: String, session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let session_tag = sanitize_session_tag(&session_id);
+    {
+        let mut tags = state
+            .agent_session_tags
+            .lock()
+            .map_err(|_| "coding agent session-tag map lock poisoned".to_string())?;
+        tags.insert(kb_id.clone(), session_tag);
+    }
+
+    let process = state
+        .agents
+        .lock()
+        .map_err(|_| "coding agent map lock poisoned".to_string())?
+        .remove(&kb_id);
+
+    if let Some(process) = process {
+        stop_agent_process(process)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_coding_agent_session(kb_id: String, session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let session_tag = sanitize_session_tag(&session_id);
+
+    let active_tag = current_agent_session_tag(&state, &kb_id);
+    if active_tag == session_tag {
+        let process = state
+            .agents
+            .lock()
+            .map_err(|_| "coding agent map lock poisoned".to_string())?
+            .remove(&kb_id);
+        if let Some(process) = process {
+            stop_agent_process(process)?;
+        }
+
+        if let Ok(mut tags) = state.agent_session_tags.lock() {
+            tags.remove(&kb_id);
+        }
+    }
+
+    let target_dir = coding_agent_home_dir(&state, &kb_id, &session_tag);
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn check_model_health(state: State<'_, AppState>) -> Result<ModelHealth, String> {
     let settings = load_app_settings(&state)?;
     let api_key = settings.packy_api_key.trim().to_string();
@@ -2571,6 +2735,7 @@ fn prepare_state(app: &AppHandle) -> Result<AppState, String> {
         data_dir,
         db_path,
         agents: Arc::new(Mutex::new(HashMap::new())),
+        agent_session_tags: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
@@ -2602,6 +2767,8 @@ pub fn run() {
             get_effective_storage_path,
             abort_coding_agent,
             stop_coding_agent,
+            set_coding_agent_session,
+            delete_coding_agent_session,
             check_model_health
         ])
         .run(tauri::generate_context!())

@@ -83,6 +83,22 @@ cd /Users/llm/Desktop/Code/PageNexus
 npm run prepare:python:win
 ```
 
+准备内置 Node runtime（分平台）：
+
+macOS / Linux:
+
+```bash
+cd /Users/llm/Desktop/Code/PageNexus
+npm run prepare:node:mac
+```
+
+Windows (PowerShell):
+
+```powershell
+cd /Users/llm/Desktop/Code/PageNexus
+npm run prepare:node:win
+```
+
 运行测试：
 
 ```bash
@@ -197,9 +213,10 @@ git push origin pagenexus-v0.1.0
 当前打包逻辑是对的，和现在仓库实现一致：
 
 - 打包资源包含 Node sidecar + Python 目录
+- 打包资源包含 Node sidecar + 内置 Node runtime + Python 目录
 - PDF 分片优先使用 Python runtime
 - 可在设置页手动指定 Python 路径实现 agent/分片统一运行时
-- CI 会在 macOS/Windows 打包前自动创建 `python/venv` 并安装 `python/requirements.txt`
+- CI 会在 macOS/Windows 打包前自动创建 `python/venv`，并准备内置 `node-runtime`
 
 ## 运行时说明
 

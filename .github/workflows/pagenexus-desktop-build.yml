@@ -54,10 +54,19 @@ jobs:
         if: runner.os != 'Windows'
         run: ./scripts/prepare-python-runtime.sh
 
+      - name: Prepare Node runtime (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: ./scripts/prepare-node-runtime.sh
+
       - name: Prepare Python runtime (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/prepare-python-runtime.ps1
+
+      - name: Prepare Node runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-node-runtime.ps1
 
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v0.6.1
