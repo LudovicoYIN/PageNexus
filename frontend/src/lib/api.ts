@@ -19,8 +19,16 @@ export async function listKnowledgeBases(): Promise<KnowledgeBase[]> {
   return invoke("list_knowledge_bases");
 }
 
+export async function deleteKnowledgeBase(kbId: string): Promise<void> {
+  return invoke("delete_knowledge_base", { kbId });
+}
+
 export async function uploadPdf(kbId: string, filePath: string): Promise<DocumentRecord> {
   return invoke("upload_pdf", { kbId, filePath });
+}
+
+export async function retryDocumentParse(docId: string): Promise<DocumentRecord> {
+  return invoke("retry_document_parse", { docId });
 }
 
 export async function listDocuments(kbId: string): Promise<DocumentRecord[]> {
@@ -82,4 +90,8 @@ export async function getAppSettings(): Promise<AppSettings> {
 
 export async function saveAppSettings(settings: AppSettings): Promise<void> {
   return invoke("save_app_settings", { settings });
+}
+
+export async function getEffectiveStoragePath(): Promise<string> {
+  return invoke("get_effective_storage_path");
 }

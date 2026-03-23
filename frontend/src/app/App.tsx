@@ -1,4 +1,3 @@
-import { appDataDir } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -8,6 +7,7 @@ import {
   Bot,
   Cpu,
   FileText,
+  FolderOpen,
   LoaderCircle,
   Plus,
   RefreshCcw,
@@ -21,10 +21,13 @@ import { PiAgentInterface } from "../components/PiAgentInterface";
 import {
   checkModelHealth,
   createKnowledgeBase,
+  deleteKnowledgeBase,
   deleteDocument,
+  getEffectiveStoragePath,
   getAppSettings,
   listDocuments,
   listKnowledgeBases,
+  retryDocumentParse,
   saveAppSettings,
   stopCodingAgent,
   uploadPdf,
@@ -46,6 +49,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   packy_api_base_url: "https://www.packyapi.com/v1",
   packy_model_id: "gpt-5.4-low",
   mineru_api_token: "",
+  storage_dir: "",
 };
 
 function createTimestampLabel() {
@@ -144,7 +148,7 @@ export function App() {
 
   useEffect(() => {
     void (async () => {
-      setStoragePath(await appDataDir());
+      setStoragePath(await getEffectiveStoragePath());
       const nextSettings = await getAppSettings();
       setSettings(nextSettings);
       await syncPiProviderKey(nextSettings.packy_api_key);
@@ -365,7 +369,9 @@ export function App() {
         packy_api_base_url: settings.packy_api_base_url.trim() || DEFAULT_SETTINGS.packy_api_base_url,
         packy_model_id: settings.packy_model_id.trim() || DEFAULT_SETTINGS.packy_model_id,
         mineru_api_token: settings.mineru_api_token.trim(),
+        storage_dir: settings.storage_dir.trim(),
       };
+      const previousStoragePath = storagePath;
       await saveAppSettings(nextSettings);
       setSettings(nextSettings);
       await syncPiProviderKey(nextSettings.packy_api_key);
@@ -381,12 +387,71 @@ export function App() {
 
       setAgentBootNonce((value) => value + 1);
       await refreshHealth();
+      if (nextSettings.storage_dir && nextSettings.storage_dir !== previousStoragePath) {
+        logDiagnostic("存储目录已保存，重启应用后生效。");
+      }
       logDiagnostic("模型设置已保存。");
     } catch (error) {
       logDiagnostic(`保存设置失败：${String(error)}`);
     } finally {
       setIsSavingSettings(false);
     }
+  };
+
+  const handleRetryDocument = async (documentId: string) => {
+    if (!activeKbId) return;
+    try {
+      setDocumentsByKb((previous) => ({
+        ...previous,
+        [activeKbId]: (previous[activeKbId] ?? []).map((document) =>
+          document.id === documentId
+            ? { ...document, status: "parsing", error_message: null, updated_at: new Date().toISOString() }
+            : document,
+        ),
+      }));
+      const nextDocument = await retryDocumentParse(documentId);
+      await refreshDocuments(activeKbId);
+      logDiagnostic(`重试解析完成：${nextDocument.file_name} (${nextDocument.status})`);
+    } catch (error) {
+      await refreshDocuments(activeKbId);
+      logDiagnostic(`重试解析失败：${String(error)}`);
+    }
+  };
+
+  const handleDeleteKnowledgeBase = async (kbId: string, kbName: string) => {
+    const confirmed = await confirm(`确认删除知识库「${kbName}」及其全部文档和会话？`, {
+      title: "删除知识库",
+      kind: "warning",
+    });
+    if (!confirmed) return;
+    try {
+      await deleteKnowledgeBase(kbId);
+      setDocumentsByKb((previous) => {
+        const next = { ...previous };
+        delete next[kbId];
+        return next;
+      });
+      if (activeKbId === kbId) {
+        const remaining = knowledgeBases.filter((item) => item.id !== kbId);
+        setActiveKbId(remaining.length > 0 ? remaining[0].id : null);
+      }
+      await refreshKnowledgeBases();
+      logDiagnostic(`已删除知识库：${kbName}`);
+    } catch (error) {
+      logDiagnostic(`删除知识库失败：${String(error)}`);
+    }
+  };
+
+  const handlePickStorageDir = async () => {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: settings.storage_dir.trim() || storagePath,
+    });
+    if (!selected || Array.isArray(selected)) {
+      return;
+    }
+    setSettings((current) => ({ ...current, storage_dir: selected }));
   };
 
   return (
@@ -412,36 +477,49 @@ export function App() {
             {knowledgeBases.map((knowledgeBase) => {
               const active = knowledgeBase.id === activeKbId && view === "workspace";
               return (
-                <button
+                <div
                   key={knowledgeBase.id}
-                  onClick={() => {
-                    setActiveKbId(knowledgeBase.id);
-                    setView("workspace");
-                  }}
                   className={`w-full rounded-[1.8rem] px-4 py-4 text-left transition-all ${
                     active ? "bg-white shadow-lg shadow-emerald-900/10 ring-1 ring-emerald-100" : "hover:bg-white/55"
                   }`}
                 >
-                  <div className="flex items-center gap-3">
-                    <div
-                      className={`h-2.5 w-2.5 rounded-full ${
-                        knowledgeBase.theme === "green"
-                          ? "bg-emerald-400"
-                          : knowledgeBase.theme === "yellow"
-                            ? "bg-amber-400"
-                            : knowledgeBase.theme === "blue"
-                              ? "bg-sky-400"
-                              : "bg-rose-400"
-                      }`}
-                    />
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-black text-slate-900">{knowledgeBase.name}</div>
-                      <div className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">
-                        {(documentsByKb[knowledgeBase.id] ?? []).length} docs
+                  <div className="flex items-start gap-2">
+                    <button
+                      onClick={() => {
+                        setActiveKbId(knowledgeBase.id);
+                        setView("workspace");
+                      }}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={`h-2.5 w-2.5 rounded-full ${
+                            knowledgeBase.theme === "green"
+                              ? "bg-emerald-400"
+                              : knowledgeBase.theme === "yellow"
+                                ? "bg-amber-400"
+                                : knowledgeBase.theme === "blue"
+                                  ? "bg-sky-400"
+                                  : "bg-rose-400"
+                          }`}
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-black text-slate-900">{knowledgeBase.name}</div>
+                          <div className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">
+                            {(documentsByKb[knowledgeBase.id] ?? []).length} docs
+                          </div>
+                        </div>
                       </div>
-                    </div>
+                    </button>
+                    <button
+                      onClick={() => void handleDeleteKnowledgeBase(knowledgeBase.id, knowledgeBase.name)}
+                      className="rounded-full p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                      title="删除知识库"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>
@@ -600,12 +678,23 @@ export function App() {
                               <div className="mt-2 text-[11px] leading-5 text-rose-600">{document.error_message}</div>
                             ) : null}
                           </div>
-                          <button
-                            onClick={() => void handleDeleteDocument(document.id)}
-                            className="rounded-full p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </button>
+                          <div className="flex items-center gap-1">
+                            {document.status === "failed" ? (
+                              <button
+                                onClick={() => void handleRetryDocument(document.id)}
+                                className="rounded-full p-2 text-slate-400 transition-colors hover:bg-amber-50 hover:text-amber-600"
+                                title="重试解析"
+                              >
+                                <RefreshCcw className="h-4 w-4" />
+                              </button>
+                            ) : null}
+                            <button
+                              onClick={() => void handleDeleteDocument(document.id)}
+                              className="rounded-full p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -665,7 +754,19 @@ export function App() {
                 <div className="mt-6 space-y-5 text-sm text-slate-600">
                   <div>
                     <div className="text-xs font-black uppercase tracking-[0.18em] text-slate-400">Storage</div>
-                    <div className="mt-2 break-all rounded-2xl bg-white/70 px-4 py-4 font-medium">{storagePath}</div>
+                    <input
+                      value={settings.storage_dir}
+                      onChange={(event) => setSettings((current) => ({ ...current, storage_dir: event.target.value }))}
+                      placeholder={`留空使用默认目录：${storagePath}`}
+                      className="mt-3 w-full rounded-2xl border border-emerald-100 bg-white/70 px-4 py-4 font-medium outline-none transition focus:border-emerald-300"
+                    />
+                    <button
+                      onClick={() => void handlePickStorageDir()}
+                      className="mt-3 inline-flex items-center gap-2 rounded-2xl bg-white/80 px-4 py-3 text-sm font-black text-slate-700 ring-1 ring-white/70"
+                    >
+                      <FolderOpen className="h-4 w-4" />
+                      选择文件夹
+                    </button>
                   </div>
                   <div>
                     <div className="text-xs font-black uppercase tracking-[0.18em] text-slate-400">Model</div>
