@@ -986,7 +986,7 @@ fn count_pdf_pages(source: &Path) -> Result<usize, String> {
 
 fn count_pdf_pages_with_python(app: &AppHandle, state: &AppState, source: &Path) -> Result<usize, String> {
     let python_bin = resolve_python_binary_path(app, state)?;
-    let probe = r#"import fitz, sys; doc = fitz.open(sys.argv[1]); print(len(doc))"#;
+    let probe = r#"import fitz, sys; doc = fitz.open(sys.argv[1]); try: print(len(doc)) finally: doc.close()"#;
     let output = Command::new(&python_bin)
         .arg("-c")
         .arg(probe)
