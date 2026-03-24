@@ -9,6 +9,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ant-design/icons": "^6.1.0",
+    "@ant-design/x": "^2.4.0",
+    "@ant-design/x-markdown": "^2.4.0",
     "@mariozechner/mini-lit": "^0.2.1",
     "@mariozechner/pi-agent-core": "^0.61.1",
     "@mariozechner/pi-ai": "^0.61.1",
@@ -16,10 +19,16 @@
     "@sinclair/typebox": "^0.34.41",
     "@tauri-apps/api": "^2.3.0",
     "@tauri-apps/plugin-dialog": "^2.2.0",
+    "antd": "^6.3.3",
+    "katex": "^0.16.40",
     "lit": "^3.3.2",
     "lucide-react": "^0.511.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.17",

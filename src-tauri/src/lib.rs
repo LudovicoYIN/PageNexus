@@ -986,7 +986,12 @@ fn count_pdf_pages(source: &Path) -> Result<usize, String> {
 
 fn count_pdf_pages_with_python(app: &AppHandle, state: &AppState, source: &Path) -> Result<usize, String> {
     let python_bin = resolve_python_binary_path(app, state)?;
-    let probe = r#"import fitz, sys; doc = fitz.open(sys.argv[1]); try: print(len(doc)) finally: doc.close()"#;
+    let probe = r#"import fitz
+import sys
+
+with fitz.open(sys.argv[1]) as doc:
+    print(len(doc))
+"#;
     let output = Command::new(&python_bin)
         .arg("-c")
         .arg(probe)
@@ -2507,6 +2512,23 @@ fn get_document_page(doc_id: String, page_number: i64, state: State<'_, AppState
 }
 
 #[tauri::command]
+fn get_document_markdown(doc_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let connection = db_connection(&state.db_path)?;
+    let document = connection
+        .query_row(
+            "SELECT id, kb_id, file_name, source_path, page_count, status, error_message, created_at, updated_at FROM documents WHERE id = ?1",
+            [doc_id],
+            row_to_document,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let markdown_path = document_dir(&state, &document.kb_id, &document.id)
+        .join("parsed")
+        .join("full.md");
+    fs::read_to_string(&markdown_path).map_err(|error| format!("读取 markdown 失败 ({}): {}", markdown_path.display(), error))
+}
+
+#[tauri::command]
 fn delete_document(doc_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let connection = db_connection(&state.db_path)?;
     let document = connection
@@ -2814,6 +2836,7 @@ pub fn run() {
             search_text,
             read_pages,
             get_document_page,
+            get_document_markdown,
             delete_document,
             save_chat_session,
             load_chat_session,

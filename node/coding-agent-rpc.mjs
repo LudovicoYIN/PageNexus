@@ -21,6 +21,7 @@ const agentDir = path.join(appHome, "agent-home");
 const apiKey = process.env.PACKY_API_KEY;
 const baseUrl = process.env.PACKY_API_BASE_URL ?? "https://www.packyapi.com/v1";
 const modelId = process.env.PACKY_MODEL_ID ?? "gpt-5.4-low";
+const apiMode = process.env.PACKY_API_MODE ?? "openai-completions";
 const pythonBin = process.env.PAGENEXUS_PYTHON_BIN ?? "";
 
 if (!apiKey) {
@@ -53,6 +54,10 @@ const kbPrompt = [
   "Do not modify, rename, or delete files in this workspace.",
   "If the evidence is insufficient, say clearly that the answer was not found in the current knowledge base.",
   "When you answer with evidence, always cite file name and page number in the format 《文件名》p.N.",
+  "Every final answer must include at least one citation in the format 《文件名》p.N when evidence exists.",
+  "If multiple facts come from different pages, include multiple citations.",
+  "For each important claim, include one short verbatim quote from the source text, then append citation in the same line: 「原文摘录」《文件名》p.N.",
+  "Do not provide uncited claims. If no quote is available, explicitly state the evidence is insufficient.",
   "Prefer citing the parsed document's original file name, not pages.json.",
 ].join("\n");
 
@@ -89,7 +94,7 @@ function normalizeSchema(schema) {
 const model = {
   id: modelId,
   name: modelId,
-  api: "openai-responses",
+  api: apiMode,
   provider: "packyapi",
   baseUrl,
   reasoning: true,

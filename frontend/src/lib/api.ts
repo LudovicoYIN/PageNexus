@@ -52,6 +52,10 @@ export async function getDocumentPage(docId: string, pageNumber: number): Promis
   return invoke("get_document_page", { docId, pageNumber });
 }
 
+export async function getDocumentMarkdown(docId: string): Promise<string> {
+  return invoke("get_document_markdown", { docId });
+}
+
 export async function deleteDocument(docId: string): Promise<void> {
   return invoke("delete_document", { docId });
 }

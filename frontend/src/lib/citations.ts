@@ -1,6 +1,6 @@
 import type { SourceCitation } from "./types";
 
-const CITATION_PATTERN = /《([^》]+)》\s*p\.(\d+)/g;
+const CITATION_PATTERN = /《([^》]+)》\s*(?:p\s*\.?\s*(\d+)|第\s*(\d+)\s*页)/gi;
 
 export function parseCitations(text: string): SourceCitation[] {
   const seen = new Set<string>();
@@ -8,7 +8,8 @@ export function parseCitations(text: string): SourceCitation[] {
 
   for (const match of text.matchAll(CITATION_PATTERN)) {
     const docName = match[1]?.trim();
-    const pageNumber = Number.parseInt(match[2] || "", 10);
+    const pageRaw = match[2] || match[3] || "";
+    const pageNumber = Number.parseInt(pageRaw, 10);
     if (!docName || Number.isNaN(pageNumber)) continue;
 
     const key = `${docName}:${pageNumber}`;

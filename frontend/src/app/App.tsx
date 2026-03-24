@@ -1,29 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
+import type { InputRef } from "antd";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Activity,
-  ArrowLeft,
-  BookOpenText,
-  Bot,
-  ChevronRight,
-  Cpu,
-  FileText,
-  FolderOpen,
-  Globe,
-  Key,
-  LayoutDashboard,
-  LoaderCircle,
-  MessageSquare,
-  Plus,
-  RefreshCcw,
-  Settings,
-  Sparkles,
-  Terminal,
-  Trash2,
-  Upload,
-} from "lucide-react";
-import { PiAgentInterface } from "../components/PiAgentInterface";
 import {
   checkModelHealth,
   createKnowledgeBase,
@@ -31,6 +9,7 @@ import {
   deleteDocument,
   deleteKnowledgeBase,
   getAppSettings,
+  getDocumentMarkdown,
   getEffectiveStoragePath,
   listDocuments,
   listKnowledgeBases,
@@ -43,6 +22,7 @@ import {
 import { asAgent, CodingAgentSessionAdapter } from "../lib/coding-agent-session";
 import { syncPiProviderKey } from "../lib/pi-storage";
 import type { AppSettings, DocumentRecord, KnowledgeBase, ModelHealth } from "../lib/types";
+import { CanvasView, CreateWorkspaceModal, DashboardView, SettingsView } from "./views";
 
 type ViewMode = "dashboard" | "canvas" | "settings";
 
@@ -75,23 +55,6 @@ function createTimestampLabel() {
   });
 }
 
-function statusTone(document: DocumentRecord) {
-  switch (document.status) {
-    case "parsed":
-      return "text-emerald-600 bg-emerald-500/10";
-    case "failed":
-      return "text-rose-600 bg-rose-500/10";
-    case "parsing":
-      return "text-amber-700 bg-amber-500/10";
-    default:
-      return "text-slate-500 bg-slate-500/10";
-  }
-}
-
-function GlowCard(props: React.PropsWithChildren<{ className?: string }>) {
-  return <div className={`glass-panel rounded-[2rem] ${props.className ?? ""}`}>{props.children}</div>;
-}
-
 function fileNameFromPath(filePath: string) {
   return filePath.split(/[\\/]/).pop() ?? filePath;
 }
@@ -104,6 +67,10 @@ export function App() {
   const [documentsByKb, setDocumentsByKb] = useState<Record<string, DocumentRecord[]>>({});
   const [workspaceSessions, setWorkspaceSessions] = useState<WorkspaceSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activePreviewDocId, setActivePreviewDocId] = useState<string | null>(null);
+  const [activePreviewMarkdown, setActivePreviewMarkdown] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   const [isCreateKbOpen, setIsCreateKbOpen] = useState(false);
   const [newKbName, setNewKbName] = useState("");
@@ -123,7 +90,7 @@ export function App() {
   const activeKbRef = useRef<string | null>(null);
   const activeAgentSessionRef = useRef<{ kbId: string; sessionId: string } | null>(null);
   const isSwitchingSessionRef = useRef(false);
-  const createKbInputRef = useRef<HTMLInputElement | null>(null);
+  const createKbInputRef = useRef<InputRef | null>(null);
   const activeSessionRef = useRef<CodingAgentSessionAdapter | null>(null);
 
   const activeKb = useMemo(
@@ -131,6 +98,10 @@ export function App() {
     [activeKbId, knowledgeBases],
   );
   const activeDocuments = activeKbId ? documentsByKb[activeKbId] ?? [] : [];
+  const activePreviewDoc = useMemo(
+    () => activeDocuments.find((document) => document.id === activePreviewDocId) ?? null,
+    [activeDocuments, activePreviewDocId],
+  );
   const canvasSessions = useMemo(
     () => workspaceSessions.filter((session) => session.kbId === activeKbId),
     [activeKbId, workspaceSessions],
@@ -143,21 +114,27 @@ export function App() {
   const refreshKnowledgeBases = async () => {
     const nextKnowledgeBases = await listKnowledgeBases();
     setKnowledgeBases(nextKnowledgeBases);
-    await Promise.all(
-      nextKnowledgeBases.map(async (knowledgeBase) => {
-        try {
-          await refreshDocuments(knowledgeBase.id);
-        } catch {
-          // ignore
-        }
-      }),
-    );
   };
 
   const refreshDocuments = async (kbId: string) => {
     const documents = await listDocuments(kbId);
     setDocumentsByKb((previous) => ({ ...previous, [kbId]: documents }));
     return documents;
+  };
+
+  const openDocumentPreview = async (docId: string) => {
+    setActivePreviewDocId(docId);
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const markdown = await getDocumentMarkdown(docId);
+      setActivePreviewMarkdown(markdown);
+    } catch (error) {
+      setActivePreviewMarkdown("");
+      setPreviewError(String(error));
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   const refreshHealth = async () => {
@@ -210,12 +187,19 @@ export function App() {
     switchAgentSession(kbId, session.id, true);
   };
 
-  const enterWorkspace = async (knowledgeBase: KnowledgeBase) => {
+  const preloadWorkspace = (knowledgeBase: KnowledgeBase) => {
+    const docs = documentsByKb[knowledgeBase.id];
+    if (docs === undefined) {
+      void refreshDocuments(knowledgeBase.id).catch(() => undefined);
+    }
+  };
+
+  const enterWorkspace = (knowledgeBase: KnowledgeBase) => {
     setActiveKbId(knowledgeBase.id);
     activeKbRef.current = knowledgeBase.id;
     setView("canvas");
     ensureWorkspaceSession(knowledgeBase.id, knowledgeBase.name);
-    await refreshDocuments(knowledgeBase.id).catch((error) => logDiagnostic(`加载文档失败：${String(error)}`));
+    preloadWorkspace(knowledgeBase);
   };
 
   const openSettings = () => {
@@ -226,6 +210,30 @@ export function App() {
   useEffect(() => {
     activeKbRef.current = activeKbId;
   }, [activeKbId]);
+
+  useEffect(() => {
+    if (!activeKbId) {
+      setActivePreviewDocId(null);
+      setActivePreviewMarkdown("");
+      setPreviewError(null);
+      return;
+    }
+
+    const docs = documentsByKb[activeKbId] ?? [];
+    if (docs.length === 0) {
+      setActivePreviewDocId(null);
+      setActivePreviewMarkdown("");
+      setPreviewError(null);
+      return;
+    }
+
+    if (activePreviewDocId && docs.some((document) => document.id === activePreviewDocId)) {
+      return;
+    }
+
+    const fallback = docs.find((document) => document.status === "parsed") ?? docs[0];
+    void openDocumentPreview(fallback.id);
+  }, [activeKbId, documentsByKb, activePreviewDocId]);
 
   useEffect(() => {
     if (!isCreateKbOpen) return;
@@ -290,7 +298,7 @@ export function App() {
         await previousSession.dispose().catch(() => undefined);
       }
 
-      if (!activeKbId || view !== "canvas") return;
+      if (!activeKbId) return;
       if (isSwitchingSessionRef.current) return;
 
       setIsBootingAgent(true);
@@ -323,7 +331,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeKbId, view, agentBootNonce]);
+  }, [activeKbId, agentBootNonce]);
 
   useEffect(() => {
     return () => {
@@ -345,7 +353,7 @@ export function App() {
       setKnowledgeBases((previous) => [knowledgeBase, ...previous]);
       setIsCreateKbOpen(false);
       setNewKbName("");
-      await enterWorkspace(knowledgeBase);
+      enterWorkspace(knowledgeBase);
       logDiagnostic(`已创建知识库：${knowledgeBase.name}`);
     } catch (error) {
       logDiagnostic(`创建知识库失败：${String(error)}`);
@@ -556,427 +564,76 @@ export function App() {
       </div>
 
       <div className="relative z-10 flex h-screen flex-col p-4">
-        {view === "dashboard" && (
-          <div className="soft-scrollbar flex-1 overflow-y-auto p-6">
-            <div className="mx-auto w-full max-w-6xl">
-              <div className="mb-10 flex items-center justify-between">
-                <div>
-                  <h1 className="text-5xl font-black italic tracking-tight text-slate-900">PageNexus.</h1>
-                  <p className="mt-2 text-[10px] font-bold uppercase tracking-[0.4em] text-slate-400">Workspace Dashboard</p>
-                </div>
-                <button
-                  onClick={openSettings}
-                  className="rounded-2xl border border-white bg-white p-4 shadow-sm transition-all hover:shadow-md"
-                >
-                  <Settings className="h-5 w-5 text-slate-500" />
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-                {knowledgeBases.map((knowledgeBase) => (
-                  <GlowCard
-                    key={knowledgeBase.id}
-                    className="cursor-pointer rounded-[2.5rem] p-7 transition-all hover:-translate-y-0.5"
-                  >
-                    <div className="flex h-full min-h-[220px] flex-col justify-between">
-                      <button
-                        className="text-left"
-                        onClick={() => void enterWorkspace(knowledgeBase)}
-                      >
-                        <div className="mb-6 flex items-center justify-between">
-                          <div
-                            className={`h-3 w-3 rounded-full ${
-                              knowledgeBase.theme === "green"
-                                ? "bg-emerald-500"
-                                : knowledgeBase.theme === "yellow"
-                                  ? "bg-amber-500"
-                                  : knowledgeBase.theme === "blue"
-                                    ? "bg-sky-500"
-                                    : "bg-rose-500"
-                            }`}
-                          />
-                          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">workspace</span>
-                        </div>
-                        <h3 className="line-clamp-2 text-2xl font-black italic tracking-tight text-slate-900">{knowledgeBase.name}</h3>
-                        <p className="mt-3 text-xs font-semibold text-slate-500">已解析 {(documentsByKb[knowledgeBase.id] ?? []).length} 份文档</p>
-                      </button>
-
-                      <div className="mt-6 flex items-center justify-between">
-                        <button
-                          onClick={() => void handleDeleteKnowledgeBase(knowledgeBase.id, knowledgeBase.name)}
-                          className="rounded-full p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={() => void enterWorkspace(knowledgeBase)}
-                          className="flex h-10 w-10 items-center justify-center rounded-full bg-white/70"
-                        >
-                          <ChevronRight className="h-5 w-5 text-slate-700" />
-                        </button>
-                      </div>
-                    </div>
-                  </GlowCard>
-                ))}
-
-                <button
-                  onClick={() => setIsCreateKbOpen(true)}
-                  className="flex min-h-[220px] flex-col items-center justify-center rounded-[2.5rem] border-2 border-dashed border-slate-200 bg-white/20 transition-all hover:border-emerald-400/50 hover:bg-emerald-50/30"
-                >
-                  <div className="flex h-14 w-14 items-center justify-center rounded-[1.2rem] bg-white shadow-sm">
-                    <Plus className="h-7 w-7" />
-                  </div>
-                  <span className="mt-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Create Workspace</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {view === "canvas" && (
-          <div className="flex min-h-0 flex-1 gap-4">
-            <aside className="glass-panel flex w-[20rem] shrink-0 flex-col rounded-[2.5rem] p-5">
-              <button
-                onClick={() => setView("dashboard")}
-                className="mb-6 flex items-center justify-center gap-3 rounded-2xl bg-slate-900 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white"
-              >
-                <LayoutDashboard className="h-4 w-4" />
-                Dashboard
-              </button>
-
-              <div className="mb-5 px-2">
-                <div className="text-[9px] font-black uppercase tracking-[0.25em] text-slate-400">Active Space</div>
-                <div className="mt-2 truncate text-sm font-black text-slate-900">{activeKb?.name ?? "No Workspace"}</div>
-              </div>
-
-              <div className="mb-4 flex items-center justify-between px-2">
-                <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">Sessions</span>
-                <button
-                  onClick={handleCreateWorkspaceSession}
-                  className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-900 hover:text-white"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              <div className="soft-scrollbar mb-6 flex-1 space-y-2 overflow-y-auto pr-1">
-                {canvasSessions.map((session) => (
-                  <div
-                    key={session.id}
-                    className={`flex items-center gap-2 rounded-[1.2rem] border px-2 py-2 transition-all ${
-                      activeSessionId === session.id
-                        ? "border-white bg-white text-slate-900 shadow-sm"
-                        : "border-transparent text-slate-500 hover:bg-white/50"
-                    }`}
-                  >
-                    <button
-                      onClick={() => {
-                        setActiveSessionId(session.id);
-                        if (!activeKbId) return;
-                        switchAgentSession(activeKbId, session.id);
-                      }}
-                      className="flex min-w-0 flex-1 items-center gap-3 px-1 py-1 text-left"
-                    >
-                      <MessageSquare className={`h-3.5 w-3.5 ${activeSessionId === session.id ? "text-emerald-500" : "opacity-50"}`} />
-                      <span className="truncate text-xs font-bold">{session.title}</span>
-                    </button>
-                    <button
-                      onClick={() => void handleDeleteWorkspaceSession(session.id)}
-                      className="rounded-full p-1.5 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
-                      title="删除会话"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
-                {canvasSessions.length === 0 ? (
-                  <div className="rounded-xl bg-white/50 px-3 py-3 text-xs text-slate-400">暂无会话。</div>
-                ) : null}
-              </div>
-
-              <div className="border-t border-white/60 pt-4">
-                <div className="mb-3 flex items-center justify-between px-2">
-                  <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">Library</span>
-                  <button
-                    onClick={handleUpload}
-                    disabled={isUploading || !activeKbId}
-                    className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-emerald-600 hover:text-white disabled:opacity-50"
-                  >
-                    {isUploading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
-                  </button>
-                </div>
-                <div className="soft-scrollbar max-h-[16rem] space-y-2 overflow-y-auto pr-1">
-                  {activeDocuments.map((document) => (
-                    <div key={document.id} className="rounded-[1rem] px-3 py-3 transition-colors hover:bg-white/50">
-                      <div className="flex items-start gap-2">
-                        <FileText className="mt-0.5 h-4 w-4 text-slate-400" />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-xs font-bold text-slate-700">{document.file_name}</div>
-                          <div className="mt-1 flex items-center gap-1.5">
-                            <span className={`rounded-full px-2 py-0.5 text-[9px] font-black uppercase tracking-widest ${statusTone(document)}`}>
-                              {document.status}
-                            </span>
-                            <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">{document.page_count} p</span>
-                          </div>
-                        </div>
-                        <div className="flex gap-1">
-                          {document.status === "failed" ? (
-                            <button
-                              onClick={() => void handleRetryDocument(document.id)}
-                              className="rounded-full p-1.5 text-slate-400 hover:bg-amber-50 hover:text-amber-600"
-                            >
-                              <RefreshCcw className="h-3.5 w-3.5" />
-                            </button>
-                          ) : null}
-                          <button
-                            onClick={() => void handleDeleteDocument(document.id)}
-                            className="rounded-full p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                  {activeDocuments.length === 0 ? (
-                    <div className="rounded-[1rem] border border-dashed border-white/80 bg-white/35 px-4 py-6 text-center">
-                      <BookOpenText className="mx-auto h-8 w-8 text-slate-300" />
-                      <div className="mt-2 text-xs font-bold text-slate-500">还没有文档</div>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-            </aside>
-
-            <GlowCard className="relative min-w-0 flex-1 overflow-hidden p-0">
-              {!activeKb ? (
-                <div className="flex h-full items-center justify-center p-10">
-                  <div className="max-w-xl rounded-[2.4rem] bg-white/70 p-10 shadow-sm">
-                    <div className="flex items-center gap-4">
-                      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-900 text-white">
-                        <Sparkles className="h-5 w-5" />
-                      </div>
-                      <div>
-                        <div className="text-[10px] font-black uppercase tracking-[0.28em] text-slate-400">Nexus Canvas</div>
-                        <div className="mt-2 text-base font-black text-slate-900">先进入一个 Workspace</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : isBootingAgent ? (
-                <div className="flex h-full items-center justify-center p-10">
-                  <div className="rounded-[2rem] bg-white/75 px-8 py-6 text-sm font-black text-slate-600 shadow-sm">正在连接 pi coding agent...</div>
-                </div>
-              ) : activeAgent ? (
-                <div className="agent-shell h-full px-4 py-4">
-                  <PiAgentInterface session={activeAgent} />
-                </div>
-              ) : (
-                <div className="flex h-full items-center justify-center p-10">
-                  <div className="rounded-[2rem] bg-white/75 px-8 py-6 text-sm font-black text-rose-500 shadow-sm">Agent 未启动，请查看诊断日志。</div>
-                </div>
-              )}
-            </GlowCard>
-          </div>
-        )}
-
-        {view === "settings" && (
-          <div className="flex-1 overflow-y-auto rounded-[2rem] bg-white/40 p-8 backdrop-blur-3xl">
-            <div className="mx-auto w-full max-w-5xl">
-              <div className="mb-10 flex items-center gap-5">
-                <button
-                  onClick={() => setView(settingsReturnView)}
-                  className="rounded-[1.2rem] border border-slate-100 bg-white p-3 shadow-sm transition-colors hover:bg-slate-50"
-                >
-                  <ArrowLeft className="h-5 w-5 text-slate-600" />
-                </button>
-                <h2 className="text-4xl font-black italic tracking-tight text-slate-900">Settings.</h2>
-              </div>
-
-              <div className="mb-8 grid grid-cols-1 gap-6 md:grid-cols-2">
-                <GlowCard className="rounded-[2.5rem] p-8">
-                  <div className="mb-7 flex items-center gap-4">
-                    <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-500 text-white">
-                      <Globe className="h-5 w-5" />
-                    </div>
-                    <div>
-                      <h4 className="font-black leading-none text-slate-900">模型配置</h4>
-                      <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">AI Endpoint Settings</p>
-                    </div>
-                  </div>
-                  <div className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="px-2 text-[9px] font-black uppercase tracking-widest text-slate-400">API URL</label>
-                      <input
-                        type="text"
-                        value={settings.packy_api_base_url}
-                        onChange={(event) => setSettings((current) => ({ ...current, packy_api_base_url: event.target.value }))}
-                        placeholder="https://www.packyapi.com/v1"
-                        className="w-full rounded-2xl border border-slate-100 bg-white/50 px-5 py-4 text-sm outline-none transition focus:ring-2 focus:ring-indigo-500/20"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="px-2 text-[9px] font-black uppercase tracking-widest text-slate-400">Model Name</label>
-                      <input
-                        type="text"
-                        value={settings.packy_model_id}
-                        onChange={(event) => setSettings((current) => ({ ...current, packy_model_id: event.target.value }))}
-                        placeholder="gpt-5.4-low"
-                        className="w-full rounded-2xl border border-slate-100 bg-white/50 px-5 py-4 text-sm outline-none transition focus:ring-2 focus:ring-indigo-500/20"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="px-2 text-[9px] font-black uppercase tracking-widest text-slate-400">API Key</label>
-                      <input
-                        type="password"
-                        value={settings.packy_api_key}
-                        onChange={(event) => setSettings((current) => ({ ...current, packy_api_key: event.target.value }))}
-                        placeholder="sk-..."
-                        className="w-full rounded-2xl border border-slate-100 bg-white/50 px-5 py-4 text-sm outline-none transition focus:ring-2 focus:ring-indigo-500/20"
-                      />
-                    </div>
-                  </div>
-                </GlowCard>
-
-                <GlowCard className="rounded-[2.5rem] p-8">
-                  <div className="mb-7 flex items-center gap-4">
-                    <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500 text-white">
-                      <Key className="h-5 w-5" />
-                    </div>
-                    <div>
-                      <h4 className="font-black leading-none text-slate-900">MinerU API</h4>
-                      <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">PDF Parsing Key</p>
-                    </div>
-                  </div>
-                  <div className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="px-2 text-[9px] font-black uppercase tracking-widest text-slate-400">Secret Key</label>
-                      <input
-                        type="password"
-                        value={settings.mineru_api_token}
-                        onChange={(event) => setSettings((current) => ({ ...current, mineru_api_token: event.target.value }))}
-                        placeholder="MinerU Secret..."
-                        className="w-full rounded-2xl border border-slate-100 bg-white/50 px-5 py-4 text-sm outline-none transition focus:ring-2 focus:ring-emerald-500/20"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="px-2 text-[9px] font-black uppercase tracking-widest text-slate-400">Storage</label>
-                      <input
-                        value={settings.storage_dir}
-                        onChange={(event) => setSettings((current) => ({ ...current, storage_dir: event.target.value }))}
-                        placeholder={`留空使用默认目录：${storagePath}`}
-                        className="w-full rounded-2xl border border-slate-100 bg-white/50 px-5 py-4 text-sm outline-none transition focus:ring-2 focus:ring-emerald-500/20"
-                      />
-                      <button
-                        onClick={() => void handlePickStorageDir()}
-                        className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-2.5 text-xs font-black text-slate-700 ring-1 ring-slate-100"
-                      >
-                        <FolderOpen className="h-3.5 w-3.5" />
-                        选择文件夹
-                      </button>
-                    </div>
-                  </div>
-                </GlowCard>
-              </div>
-
-              <div className="mb-6 flex gap-3">
-                <button
-                  onClick={() => void handleSaveSettings()}
-                  disabled={isSavingSettings}
-                  className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-black text-white disabled:cursor-not-allowed disabled:bg-slate-300"
-                >
-                  <Settings className="h-4 w-4" />
-                  {isSavingSettings ? "保存中..." : "保存设置"}
-                </button>
-                <button
-                  onClick={() => void refreshHealth()}
-                  className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-black text-slate-700 ring-1 ring-slate-100"
-                >
-                  <RefreshCcw className="h-4 w-4" />
-                  重新健康检查
-                </button>
-              </div>
-
-              <GlowCard className="rounded-[2.5rem] p-8">
-                <div className="mb-6 flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-slate-900 text-white">
-                      <Terminal className="h-5 w-5" />
-                    </div>
-                    <div>
-                      <h4 className="font-black leading-none text-slate-900">DIAGNOSTICS</h4>
-                      <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">System Health & Engine Logs</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 rounded-full border border-emerald-100 bg-emerald-50 px-4 py-2">
-                    <Activity className="h-3.5 w-3.5 animate-pulse text-emerald-500" />
-                    <span className="text-[9px] font-black uppercase tracking-widest text-emerald-600">
-                      {health.backend_status === "online" ? "Connection Active" : "Connection Issue"}
-                    </span>
-                  </div>
-                </div>
-                <div className="soft-scrollbar h-72 space-y-2 overflow-y-auto rounded-[1.6rem] bg-slate-900 p-6 font-mono text-[11px] text-slate-400">
-                  {diagnostics.length === 0 ? (
-                    <div className="text-slate-500">[INFO] 暂无日志。</div>
-                  ) : (
-                    diagnostics.map((entry) => (
-                      <div key={entry} className="text-slate-300">
-                        {entry}
-                      </div>
-                    ))
-                  )}
-                </div>
-              </GlowCard>
-            </div>
-          </div>
-        )}
-
-        {isCreateKbOpen ? (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/10 p-6 backdrop-blur-xl">
-            <GlowCard className="w-full max-w-lg rounded-[3rem] bg-white p-10 shadow-2xl">
-              <div className="mb-8">
-                <h2 className="text-2xl font-black italic tracking-tight text-slate-900">Create Workspace.</h2>
-                <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">Start a new local workspace</p>
-              </div>
-              <div className="space-y-4">
-                <input
-                  ref={createKbInputRef}
-                  value={newKbName}
-                  onChange={(event) => setNewKbName(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void handleCreateKnowledgeBase();
-                    }
-                    if (event.key === "Escape") {
-                      setIsCreateKbOpen(false);
-                      setNewKbName("");
-                    }
-                  }}
-                  placeholder="例如：澳洲地产法"
-                  className="w-full rounded-2xl border border-slate-100 bg-slate-50 px-6 py-4 text-sm font-bold outline-none focus:ring-2 focus:ring-emerald-500/20"
-                />
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => void handleCreateKnowledgeBase()}
-                    disabled={!newKbName.trim() || isCreatingKb}
-                    className="flex-1 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-black text-white disabled:cursor-not-allowed disabled:bg-slate-300"
-                  >
-                    {isCreatingKb ? "创建中..." : "创建 Workspace"}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setIsCreateKbOpen(false);
-                      setNewKbName("");
-                    }}
-                    className="rounded-2xl px-4 py-3 text-sm font-black text-slate-500 hover:bg-slate-100"
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
-            </GlowCard>
-          </div>
+        {view === "dashboard" ? (
+          <DashboardView
+            knowledgeBases={knowledgeBases}
+            documentsByKb={documentsByKb}
+            onOpenSettings={openSettings}
+            onEnterWorkspace={(knowledgeBase) => enterWorkspace(knowledgeBase)}
+            onHoverWorkspace={(knowledgeBase) => preloadWorkspace(knowledgeBase)}
+            onDeleteKnowledgeBase={(kbId, kbName) => void handleDeleteKnowledgeBase(kbId, kbName)}
+            onCreateWorkspace={() => setIsCreateKbOpen(true)}
+          />
         ) : null}
+
+        {view === "canvas" ? (
+          <CanvasView
+            activeKb={activeKb}
+            activeKbId={activeKbId}
+            canvasSessions={canvasSessions}
+            activeSessionId={activeSessionId}
+            isUploading={isUploading}
+            activeDocuments={activeDocuments}
+            activePreviewDocId={activePreviewDocId}
+            activePreviewDocName={activePreviewDoc?.file_name ?? "未选择文档"}
+            activePreviewMarkdown={activePreviewMarkdown}
+            activePreviewSourcePath={activePreviewDoc?.source_path}
+            previewLoading={previewLoading}
+            previewError={previewError}
+            activeAgent={activeAgent}
+            isBootingAgent={isBootingAgent}
+            onBackDashboard={() => setView("dashboard")}
+            onCreateSession={handleCreateWorkspaceSession}
+            onSelectSession={(sessionId) => {
+              setActiveSessionId(sessionId);
+              if (!activeKbId) return;
+              switchAgentSession(activeKbId, sessionId);
+            }}
+            onDeleteSession={(sessionId) => void handleDeleteWorkspaceSession(sessionId)}
+            onUpload={() => void handleUpload()}
+            onOpenDocumentPreview={(docId) => void openDocumentPreview(docId)}
+            onRetryDocument={(docId) => void handleRetryDocument(docId)}
+            onDeleteDocument={(docId) => void handleDeleteDocument(docId)}
+          />
+        ) : null}
+
+        {view === "settings" ? (
+          <SettingsView
+            settings={settings}
+            health={health}
+            diagnostics={diagnostics}
+            storagePath={storagePath}
+            isSavingSettings={isSavingSettings}
+            onBack={() => setView(settingsReturnView)}
+            onUpdateSettings={(update) => setSettings(update)}
+            onPickStorageDir={() => void handlePickStorageDir()}
+            onSaveSettings={() => void handleSaveSettings()}
+            onRefreshHealth={() => void refreshHealth()}
+          />
+        ) : null}
+
+        <CreateWorkspaceModal
+          open={isCreateKbOpen}
+          value={newKbName}
+          loading={isCreatingKb}
+          inputRef={createKbInputRef}
+          onChange={setNewKbName}
+          onCancel={() => {
+            setIsCreateKbOpen(false);
+            setNewKbName("");
+          }}
+          onCreate={() => void handleCreateKnowledgeBase()}
+        />
       </div>
     </div>
   );

@@ -125,7 +125,12 @@ export class CodingAgentSessionAdapter {
 
   private async emit(event: AgentEvent) {
     for (const listener of this.listeners) {
-      await listener(event);
+      try {
+        await listener(event);
+      } catch (error) {
+        // Keep agent message pipeline alive even if one UI listener fails.
+        console.error("coding-agent event listener failed:", error);
+      }
     }
   }
 
